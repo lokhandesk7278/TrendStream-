@@ -1,6 +1,6 @@
 import json
 import psycopg2
-from kafka import KafkaConsumer
+from confluent_kafka import Consumer, KafkaError
 
 def get_db_connection():
     return psycopg2.connect(
@@ -11,14 +11,16 @@ def get_db_connection():
         password="password123"
     )
 
-consumer = KafkaConsumer(
-    'tech-jobs',
-    bootstrap_servers=['localhost:9092'],
-    auto_offset_reset='earliest',
-    enable_auto_commit=True,
-    group_id='trendstream-group',
-    value_deserializer=lambda m: json.loads(m.decode('utf-8'))
-)
+# Configure Confluent Kafka Consumer (bypasses Windows socket bugs)
+conf = {
+    'bootstrap.servers': 'localhost:9092',
+    'group.id': 'trendstream-group',
+    'auto.offset.reset': 'earliest',
+    'enable.auto.commit': True
+}
+
+consumer = Consumer(conf)
+consumer.subscribe(['tech-jobs'])
 
 print("⚡ [TrendStream] Processor active: Ingesting from Kafka & writing to PostgreSQL...\n")
 
@@ -35,18 +37,31 @@ DO UPDATE SET
 """
 
 try:
-    for message in consumer:
-        event = message.value
+    while True:
+        msg = consumer.poll(timeout=1.0)
+        
+        if msg is None:
+            continue
+        if msg.error():
+            if msg.error().code() == KafkaError._PARTITION_EOF:
+                continue
+            else:
+                print(f"⚠️ Consumer error: {msg.error()}")
+                break
+
+        # Decode JSON payload
+        event = json.loads(msg.value().decode('utf-8'))
         skills = event.get("required_skills", [])
         
         for skill in skills:
             cursor.execute(upsert_query, (skill,))
         
         conn.commit()
-        print(f"🔄 Processed event: {event['job_title']} | Updated counts for: {skills}")
+        print(f"🔄 Processed event: {event.get('job_title', 'Unknown')} | Updated counts for: {skills}")
 
 except KeyboardInterrupt:
     print("\n🛑 Stream processor stopped.")
 finally:
+    consumer.close()
     cursor.close()
     conn.close()
